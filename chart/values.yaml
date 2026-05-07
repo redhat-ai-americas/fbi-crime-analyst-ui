@@ -35,6 +35,10 @@ service:
 
 route:
   enabled: true
+  # Default 30s router timeout drops long chat completions that fan out
+  # through gateway → agent → MCP → predictive. Bump to 5 minutes.
+  annotations:
+    haproxy.router.openshift.io/timeout: 300s
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
