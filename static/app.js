@@ -313,15 +313,17 @@ function scrollToBottom() {
 }
 
 function renderContent(text) {
-  // Phase 0: Render LaTeX blocks directly to HTML via KaTeX (if loaded).
-  // We do this before HTML escaping so the TeX source isn't mangled.
-  // The rendered HTML is stored as a placeholder and restored after
-  // all markdown processing.
+  // Phase 0: Render LaTeX blocks via KaTeX (if loaded). We do this before
+  // markdown so marked doesn't mangle the TeX source. Each rendered block
+  // is held in latexBlocks[] and substituted back in after markdown +
+  // sanitization. The placeholder uses an HTML comment so it survives
+  // both marked and DOMPurify untouched.
   var latexBlocks = [];
+  function placeholder(idx) {
+    return "<!--KTX" + idx + "-->";
+  }
   if (typeof katex !== "undefined") {
-    // Display math: \[...\]
     text = text.replace(/\\\[([\s\S]*?)\\\]/g, function (_, tex) {
-      var idx = latexBlocks.length;
       var html;
       try {
         html = katex.renderToString(tex.trim(), { displayMode: true, throwOnError: false });
@@ -329,161 +331,55 @@ function renderContent(text) {
       } catch (e) {
         html = "\\[" + tex + "\\]";
       }
-      latexBlocks.push(html);
-      return "\x00LATEX" + idx + "\x00";
-    });
-    // Inline math: \(...\)
-    text = text.replace(/\\\(([\s\S]*?)\\\)/g, function (_, tex) {
       var idx = latexBlocks.length;
+      latexBlocks.push(html);
+      return placeholder(idx);
+    });
+    text = text.replace(/\\\(([\s\S]*?)\\\)/g, function (_, tex) {
       var html;
       try {
         html = katex.renderToString(tex.trim(), { displayMode: false, throwOnError: false });
       } catch (e) {
         html = "\\(" + tex + "\\)";
       }
+      var idx = latexBlocks.length;
       latexBlocks.push(html);
-      return "\x00LATEX" + idx + "\x00";
+      return placeholder(idx);
     });
   }
 
-  // Escape HTML first
-  var safe = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-
-  // Phase 1: Extract code blocks so they aren't parsed for markdown.
-  // Replace each code block with a placeholder token.
-  var codeBlocks = [];
-  safe = safe.replace(/```(\w*)\n([\s\S]*?)```/g, function (_, lang, code) {
-    var idx = codeBlocks.length;
-    codeBlocks.push("<pre><code>" + code.trimEnd() + "</code></pre>");
-    return "\x00CODEBLOCK" + idx + "\x00";
-  });
-
-  // Phase 2: Extract inline code spans.
-  var inlineCode = [];
-  safe = safe.replace(/`([^`]+)`/g, function (_, code) {
-    var idx = inlineCode.length;
-    inlineCode.push("<code>" + code + "</code>");
-    return "\x00INLINE" + idx + "\x00";
-  });
-
-  // Phase 3: Process block-level markdown on each line.
-  var paragraphs = safe.split(/\n\n+/);
-  var rendered = [];
-
-  for (var p = 0; p < paragraphs.length; p++) {
-    var para = paragraphs[p];
-
-    if (/^\x00CODEBLOCK\d+\x00$/.test(para.trim())) {
-      rendered.push(para.trim());
-      continue;
-    }
-
-    var lines = para.split("\n");
-    var out = [];
-    var listType = null;
-    var listItems = [];
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i];
-
-      var ulMatch = /^(\-|\*) (.+)$/.exec(line);
-      var olMatch = /^(\d+)\. (.+)$/.exec(line);
-
-      if (ulMatch) {
-        if (listType && listType !== "ul") {
-          out.push("<" + listType + ">" + listItems.join("") + "</" + listType + ">");
-          listItems = [];
-        }
-        listType = "ul";
-        listItems.push("<li>" + processInline(ulMatch[2]) + "</li>");
-        continue;
-      }
-
-      if (olMatch) {
-        if (listType && listType !== "ol") {
-          out.push("<" + listType + ">" + listItems.join("") + "</" + listType + ">");
-          listItems = [];
-        }
-        listType = "ol";
-        listItems.push("<li>" + processInline(olMatch[2]) + "</li>");
-        continue;
-      }
-
-      if (listType) {
-        out.push("<" + listType + ">" + listItems.join("") + "</" + listType + ">");
-        listType = null;
-        listItems = [];
-      }
-
-      var headerMatch = /^(#{1,3}) (.+)$/.exec(line);
-      if (headerMatch) {
-        var level = headerMatch[1].length;
-        out.push("<h" + level + ">" + processInline(headerMatch[2]) + "</h" + level + ">");
-        continue;
-      }
-
-      out.push(processInline(line));
-    }
-
-    if (listType) {
-      out.push("<" + listType + ">" + listItems.join("") + "</" + listType + ">");
-    }
-
-    var joined = "";
-    for (var j = 0; j < out.length; j++) {
-      if (joined && !isBlockElement(out[j]) && !isBlockElement(out[j - 1 >= 0 ? j - 1 : 0])) {
-        joined += "<br>";
-      } else if (joined) {
-        // no separator needed between block elements
-      }
-      joined += out[j];
-    }
-
-    rendered.push(joined);
-  }
-
-  var result;
-  if (rendered.length === 1) {
-    result = rendered[0];
+  // Phase 1: Markdown via marked (GFM tables, strikethrough, autolinks,
+  // task lists, etc.). marked HTML-escapes input by default.
+  var html;
+  if (typeof marked !== "undefined") {
+    html = marked.parse(text, { gfm: true, breaks: true });
   } else {
-    var parts = [];
-    for (var k = 0; k < rendered.length; k++) {
-      if (isBlockElement(rendered[k])) {
-        parts.push(rendered[k]);
-      } else if (rendered[k].trim()) {
-        parts.push("<p>" + rendered[k] + "</p>");
-      }
-    }
-    result = parts.join("");
+    // Graceful fallback: escape and wrap in <pre> if marked failed to load.
+    html = "<pre>" + text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + "</pre>";
   }
 
-  result = result.replace(/\x00CODEBLOCK(\d+)\x00/g, function (_, idx) {
-    return codeBlocks[parseInt(idx, 10)];
-  });
-  result = result.replace(/\x00INLINE(\d+)\x00/g, function (_, idx) {
-    return inlineCode[parseInt(idx, 10)];
-  });
-  result = result.replace(/\x00LATEX(\d+)\x00/g, function (_, idx) {
-    return latexBlocks[parseInt(idx, 10)];
+  // Phase 2: Sanitize. DOMPurify strips <script>, on* handlers, javascript:
+  // URLs, etc. while keeping the safe subset marked produced. We allow the
+  // KaTeX placeholder comments through so we can substitute after sanitize.
+  if (typeof DOMPurify !== "undefined") {
+    html = DOMPurify.sanitize(html, {
+      ADD_ATTR: ["target"],
+      ALLOW_DATA_ATTR: false
+    });
+  }
+
+  // Phase 3: Restore KaTeX HTML. KaTeX output is trusted (we generated it
+  // ourselves via katex.renderToString) so it bypasses sanitization.
+  html = html.replace(/<!--KTX(\d+)-->/g, function (_, idx) {
+    return latexBlocks[parseInt(idx, 10)] || "";
   });
 
-  return result;
-}
+  // Force every <a> to open in a new tab (marked's autolinker doesn't add
+  // target by default, and DOMPurify strips it on URLs that don't already
+  // have one). Cheap post-process.
+  html = html.replace(/<a (?![^>]*\btarget=)/g, '<a target="_blank" rel="noopener noreferrer" ');
 
-function processInline(text) {
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  text = text.replace(/\*(.+?)\*/g, "<em>$1</em>");
-  return text;
-}
-
-function isBlockElement(html) {
-  if (!html) return false;
-  return /^<(h[1-3]|ul|ol|pre|p|blockquote)[\s>]/.test(html)
-      || /^\x00CODEBLOCK\d+\x00$/.test(html);
+  return html;
 }
 
 function setStreaming(value) {
